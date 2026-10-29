@@ -1,36 +1,42 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# demo-cms-spectrum
 
-## Getting Started
+Next.js demo that builds pages from Contentful entries, fetched with Contentful's GraphQL Content API. A `page` entry holds an ordered list of section entries, and each section's content type is rendered by a matching React component.
 
-First, run the development server:
+## Setup
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+1. Copy `.env.example` to `.env.local` and fill in your space ID, Delivery and Preview API tokens (Contentful → Settings → API keys).
+2. To create the content model and sample pages, add a CMA token (Contentful → Settings → CMA tokens) and run:
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+   ```bash
+   npm run contentful:seed
+   ```
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+   This creates the `page`, `hero`, `textBlock`, `cardGrid` and `card` content types plus `home` and `about` pages. It skips anything that already exists.
+3. `npm run dev` and open http://localhost:3000.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## How it fits together
 
-## Learn More
+| Path | Role |
+| --- | --- |
+| `lib/contentful/client.ts` | Sends GraphQL requests (delivery or preview) |
+| `lib/contentful/types.ts` | GraphQL response types and the plain props components receive |
+| `lib/contentful/mappers.ts` | Turns query results into those props |
+| `lib/contentful/queries.ts` | GraphQL queries and cached fetches (`getPage`, `getPageSlugs`) |
+| `components/sections/` | One component per section type, registered in `index.tsx` |
+| `app/page.tsx` | Renders the page with slug `home` |
+| `app/[slug]/page.tsx` | Renders every other page |
 
-To learn more about Next.js, take a look at the following resources:
+### Adding a component
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+1. Create the content type in Contentful and allow it in the `page.sections` field validation.
+2. Add a `... on <TypeName>` fragment to `PAGE_QUERY` in `lib/contentful/queries.ts`. GraphQL type names are the content type ID in PascalCase (`textBlock` → `TextBlock`), and reference lists are queried as `<field>Collection { items }`.
+3. Add its result type and props type to `lib/contentful/types.ts` (and to the `SectionResult` and `Section` unions).
+4. Map it in `toSection` in `lib/contentful/mappers.ts`, keyed on `__typename`.
+5. Build the component in `components/sections/` and register it in `components/sections/index.tsx`.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Until steps 2–5 are done, the page shows a dashed placeholder for that section in development.
 
-## Deploy on Vercel
+## Preview and publishing
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **Preview:** set the Contentful preview URL to `http://localhost:3000/api/draft?secret=<CONTENTFUL_PREVIEW_SECRET>&slug={entry.fields.slug}`. Draft mode reads from the Preview API and bypasses the cache. `/api/disable-draft` turns it off.
+- **Publishing:** content is cached for up to an hour. To refresh on publish, add a Contentful webhook that POSTs to `/api/revalidate` with an `x-revalidate-secret` header set to `CONTENTFUL_REVALIDATE_SECRET`.
