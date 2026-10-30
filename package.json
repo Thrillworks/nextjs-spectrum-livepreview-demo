@@ -11,6 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@contentful/live-preview": "^4.10.28",
     "@contentful/rich-text-react-renderer": "^16.2.2",
     "@contentful/rich-text-types": "^17.2.7",
     "next": "16.4.3",

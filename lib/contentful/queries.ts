@@ -1,8 +1,7 @@
 import { cacheLife, cacheTag } from "next/cache";
 import { draftMode } from "next/headers";
 import { contentfulGraphQL, isContentfulConfigured } from "./client";
-import { toArticle, toPage } from "./mappers";
-import type { Article, ArticleResult, Page, PageResult } from "./types";
+import type { ArticleResult, PageResult } from "./types";
 
 // Every Contentful read is tagged so the /api/revalidate webhook can refresh
 // them all at once when content is published.
@@ -10,6 +9,8 @@ export const CONTENTFUL_TAG = "contentful";
 
 const ASSET_FIELDS = /* GraphQL */ `
   fragment AssetFields on Asset {
+    __typename
+    sys { id }
     url
     title
     description
@@ -26,10 +27,12 @@ const PAGE_QUERY = /* GraphQL */ `
   query Page($slug: String!, $preview: Boolean!) {
     pageCollection(where: { slug: $slug }, limit: 1, preview: $preview) {
       items {
+        __typename
         sys { id }
         title
         slug
         hero(preview: $preview) {
+          __typename
           sys { id }
           heading
           text
@@ -68,6 +71,7 @@ const ARTICLE_QUERY = /* GraphQL */ `
   query Article($slug: String!, $preview: Boolean!) {
     articleCollection(where: { slug: $slug }, limit: 1, preview: $preview) {
       items {
+        __typename
         sys { id }
         title
         slug
@@ -75,6 +79,7 @@ const ARTICLE_QUERY = /* GraphQL */ `
         heroImage(preview: $preview) { ...AssetFields }
         categoryTagsCollection(limit: 10, preview: $preview) {
           items {
+            __typename
             sys { id }
             name
             slug
@@ -102,7 +107,7 @@ const PAGE_SLUGS_QUERY = /* GraphQL */ `
   }
 `;
 
-export async function getPage(slug: string): Promise<Page | null> {
+export async function getPage(slug: string): Promise<PageResult | null> {
   "use cache";
   cacheTag(CONTENTFUL_TAG, `page:${slug}`);
   cacheLife("hours");
@@ -118,8 +123,9 @@ export async function getPage(slug: string): Promise<Page | null> {
     preview,
   );
 
-  const page = data.pageCollection.items[0];
-  return page ? toPage(page) : null;
+  // Returned as the raw GraphQL result: live updates need the untransformed
+  // response. It is mapped to component props on the client (see LivePage).
+  return data.pageCollection.items[0] ?? null;
 }
 
 export async function getPageSlugs(): Promise<string[]> {
@@ -138,7 +144,7 @@ export async function getPageSlugs(): Promise<string[]> {
   return data.pageCollection.items.map((item) => item.slug);
 }
 
-export async function getArticle(slug: string): Promise<Article | null> {
+export async function getArticle(slug: string): Promise<ArticleResult | null> {
   "use cache";
   cacheTag(CONTENTFUL_TAG, `article:${slug}`);
   cacheLife("hours");
@@ -153,8 +159,7 @@ export async function getArticle(slug: string): Promise<Article | null> {
     preview,
   );
 
-  const article = data.articleCollection.items[0];
-  return article ? toArticle(article) : null;
+  return data.articleCollection.items[0] ?? null;
 }
 
 export async function getArticleSlugs(): Promise<string[]> {

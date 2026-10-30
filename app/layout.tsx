@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { Header } from "@/components/Header";
 import "./globals.css";
+import { ContentfulLivePreviewProvider } from "@contentful/live-preview/react";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -26,8 +27,15 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
-        <Header />
-        {children}
+        <ContentfulLivePreviewProvider
+          locale="en-US"
+          enableInspectorMode={true}
+          enableLiveUpdates={true}
+          targetOrigin="https://app.contentful.com"
+        >
+          <Header />
+          {children}
+        </ContentfulLivePreviewProvider>
       </body>
     </html>
   );

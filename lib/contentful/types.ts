@@ -4,9 +4,11 @@ import type { Document } from "@contentful/rich-text-types";
 // GraphQL types after content type IDs in PascalCase (mediaCopy → MediaCopy)
 // and exposes reference lists as <field>Collection { items }.
 
-type Sys = { sys: { id: string } };
+// Live updates match entries by sys.id and __typename, so every entry and
+// asset in a query must select both.
+type Sys = { __typename: string; sys: { id: string } };
 
-export type AssetResult = {
+export type AssetResult = Sys & {
   url: string;
   title: string | null;
   description: string | null;
@@ -43,12 +45,14 @@ export type OtherSectionResult = Sys & { __typename: string };
 
 export type SectionResult = MediaCopyResult | ContactFormResult;
 
+export type CategoryTagResult = Sys & { name: string; slug: string };
+
 export type ArticleResult = Sys & {
   title: string;
   slug: string;
   date: string | null;
   heroImage: AssetResult | null;
-  categoryTagsCollection: { items: ({ sys: { id: string }; name: string; slug: string } | null)[] } | null;
+  categoryTagsCollection: { items: (CategoryTagResult | null)[] } | null;
   body: { json: Document } | null;
 };
 

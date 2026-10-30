@@ -1,5 +1,5 @@
 import { notFound } from "next/navigation";
-import { Sections } from "@/components/sections";
+import { LivePage } from "@/components/live-preview/LivePage";
 import { isContentfulConfigured } from "@/lib/contentful/client";
 import { getPage } from "@/lib/contentful/queries";
 
@@ -9,11 +9,7 @@ export async function ContentfulPage({ slug }: { slug: string }) {
   const page = await getPage(slug);
   if (!page) notFound();
 
-  return (
-    <main className="flex-1">
-      <Sections sections={page.sections} />
-    </main>
-  );
+  return <LivePage page={page} />;
 }
 
 function SetupNotice() {

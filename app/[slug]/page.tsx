@@ -1,8 +1,8 @@
 import { notFound } from "next/navigation";
 import { Suspense } from "react";
-import { ArticleView } from "@/components/ArticleView";
 import { ContentfulPage } from "@/components/ContentfulPage";
-import { Sections } from "@/components/sections";
+import { LiveArticle } from "@/components/live-preview/LiveArticle";
+import { LivePage } from "@/components/live-preview/LivePage";
 import { isContentfulConfigured } from "@/lib/contentful/client";
 import { getArticle, getArticleSlugs, getPage, getPageSlugs } from "@/lib/contentful/queries";
 
@@ -23,16 +23,10 @@ async function SlugPage({ params }: Pick<PageProps<"/[slug]">, "params">) {
   if (!isContentfulConfigured) return <ContentfulPage slug={slug} />;
 
   const page = await getPage(slug);
-  if (page) {
-    return (
-      <main className="flex-1">
-        <Sections sections={page.sections} />
-      </main>
-    );
-  }
+  if (page) return <LivePage page={page} />;
 
   const article = await getArticle(slug);
-  if (article) return <ArticleView {...article} />;
+  if (article) return <LiveArticle article={article} />;
 
   notFound();
 }
