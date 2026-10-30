@@ -1,0 +1,13 @@
+# The image only copies built artefacts (see Dockerfile). Keep the build context small
+# and make sure local env files and source never reach the Docker daemon.
+node_modules
+.git
+.github
+.claude
+.env*
+.next/cache
+app
+components
+lib
+scripts
+*.md

@@ -50,3 +50,27 @@ Until steps 2–5 are done, the page shows a dashed placeholder for that section
 
 - **Preview:** set the Contentful preview URL to `http://localhost:3000/api/draft?secret=<CONTENTFUL_PREVIEW_SECRET>&slug={entry.fields.slug}`. Draft mode reads from the Preview API and bypasses the cache. `/api/disable-draft` turns it off.
 - **Publishing:** content is cached for up to an hour. To refresh on publish, add a Contentful webhook that POSTs to `/api/revalidate` with an `x-revalidate-secret` header set to `CONTENTFUL_REVALIDATE_SECRET`.
+
+## Deployment
+
+Every push to `main` deploys to <https://spectrum-livepreview.thrillworks.site> through `.github/workflows/deploy-prod.yml`, which calls the reusable `.github/workflows/deploy.yml`. Pull requests into `main` run `.github/workflows/pr-checks.yml`. There is one environment, `prod`.
+
+| Item | Value |
+| --- | --- |
+| Hosting | AWS App Runner service `tw-spectrum-livepreview-prod`, TW non-Prod account, `us-east-1`, one instance |
+| Image | ECR repository `tw-spectrum-livepreview-prod`, built from the Next.js standalone output |
+| Runtime secrets | SSM Parameter Store `/tw/spectrum-livepreview/prod/*`, injected by App Runner |
+| DNS and TLS | Route 53 zone `thrillworks.site`, App Runner managed certificate |
+
+The pipeline reads these GitHub secrets:
+
+| Secret | Use |
+| --- | --- |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Deploy credentials for the TW non-Prod account |
+| `CONTENTFUL_SPACE_ID`, `CONTENTFUL_ENVIRONMENT` | Space and environment, used at build time and at runtime |
+| `CONTENTFUL_DELIVERY_TOKEN`, `CONTENTFUL_PREVIEW_TOKEN` | Content Delivery and Content Preview API tokens |
+| `CONTENTFUL_PREVIEW_SECRET`, `CONTENTFUL_REVALIDATE_SECRET` | Optional. When unset, a value is generated once and kept in SSM |
+
+Pages are prerendered from Contentful during the build, so a change to the space ID or delivery token needs a redeploy (re-run **Deploy Production** from the Actions tab). The service runs exactly one instance because the Next.js data cache is held on the instance, and a revalidation webhook reaches only one instance.
+
+In Contentful, set the preview URL to `https://spectrum-livepreview.thrillworks.site/api/draft?secret=<CONTENTFUL_PREVIEW_SECRET>&slug={entry.fields.slug}`.
