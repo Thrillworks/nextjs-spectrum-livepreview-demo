@@ -1,0 +1,90 @@
+name: PR Checks
+
+# Runs on every pull request targeting the trunk branch. The production dependency
+# audit, lint, typecheck, unit tests and the production image build are blocking. The full
+# dependency audit and Semgrep SAST are report-only.
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Dependency audit - production (high/critical)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Dependency audit - all, including build tooling (report-only)
+        id: audit_all
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+      - name: Lint
+        run: npx eslint
+
+      # PageProps and LayoutProps are generated route types, so typegen runs first.
+      - name: Typecheck
+        run: |
+          npx next typegen
+          npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm test
+
+      - name: SAST (Semgrep)
+        id: sast
+        continue-on-error: true
+        run: |
+          python3 -m pip install --quiet semgrep
+          semgrep scan \
+            --config p/default \
+            --config p/javascript \
+            --config p/typescript \
+            --error --metrics off \
+            --sarif --output semgrep.sarif
+
+      # Builds exactly what the deploy pipeline ships: standalone server and runtime
+      # image. No Contentful credentials are passed, so pages prerender as the
+      # "Connect Contentful" notice; the build itself is what is being verified.
+      - name: Build verification
+        run: |
+          set -euo pipefail
+          bash .github/scripts/build-image-context.sh
+          docker build -t spectrum-livepreview:pr .
+
+      - name: Summary
+        if: always()
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          JOB_STATUS: ${{ job.status }}
+          AUDIT_ALL: ${{ steps.audit_all.outcome }}
+          SAST: ${{ steps.sast.outcome }}
+        run: |
+          {
+            echo "## PR Checks"
+            echo ""
+            echo "- **Branch**: ${HEAD_REF} -> ${BASE_REF}"
+            echo "- **Production audit / Lint / Typecheck / Unit tests / Build**: ${JOB_STATUS}"
+            echo "- **Full dependency audit**: ${AUDIT_ALL} (report-only)"
+            echo "- **SAST (Semgrep)**: ${SAST} (report-only)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,682 @@
+name: Deploy
+
+# Reusable build + deploy pipeline for the Spectrum live preview demo.
+#
+# Architecture: containerised Next.js standalone server on AWS App Runner (image in
+# ECR). The app is stateless, so there is no database and no VPC connector; App
+# Runner's default egress reaches Contentful directly. One App Runner service,
+# auto scaling configuration, IAM instance role and SSM parameter path per
+# environment.
+#
+# Everything below is SAFELY IDEMPOTENT. Each run checks whether every resource
+# exists and creates it if missing: ECR repo, App Runner ECR access role, SSM
+# parameters, instance role, auto scaling configuration, App Runner service, custom
+# domain + Route 53 records + managed TLS cert. Re-running on a clean account or a
+# fully provisioned one converges to the same result.
+#
+# The service is pinned to exactly one instance. Next.js keeps its data cache on
+# the instance's filesystem, so with more than one instance a /api/revalidate
+# webhook would refresh only the instance that received it.
+#
+# Naming convention (per the standard deployment model):
+#   <org>-<project>-<env>   e.g. tw-spectrum-livepreview-prod
+# Domain convention (one isolated subdomain per env):
+#   <project>-<env>.<base>  e.g. spectrum-livepreview-dev.thrillworks.site
+#   prod drops the env:     <project>.<base>   e.g. spectrum-livepreview.thrillworks.site
+# SSM parameter path:
+#   /<org>/<project>/<env>/  e.g. /tw/spectrum-livepreview/prod/CONTENTFUL_PREVIEW_TOKEN
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Logical environment (dev | stg | prod)
+        required: true
+        type: string
+      branch:
+        description: Branch being deployed (dev | stg | main)
+        required: true
+        type: string
+
+# Each value is sourced from a GitHub variable when set (environment-level overrides
+# repository-level), with a hard-coded fallback so the pipeline works before any
+# variables are configured. App Runner is not offered in ca-central-1.
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ORG_TAG: ${{ vars.ORG_TAG || 'tw' }}
+  PROJECT_ID: ${{ vars.PROJECT_ID || 'spectrum-livepreview' }}
+  CUSTOM_DOMAIN_BASE: ${{ vars.CUSTOM_DOMAIN_BASE || 'thrillworks.site' }}
+  ENABLE_CUSTOM_DOMAIN: ${{ vars.ENABLE_CUSTOM_DOMAIN || 'true' }}
+  # App Runner sizing - smallest practical for a low-traffic demo.
+  APPRUNNER_CPU: ${{ vars.APPRUNNER_CPU || '0.25 vCPU' }}
+  APPRUNNER_MEMORY: ${{ vars.APPRUNNER_MEMORY || '0.5 GB' }}
+  CONTAINER_PORT: '3000'
+  # Basic auth user. The password is the BASIC_AUTH_PASSWORD secret, or generated once
+  # into SSM when that secret is unset.
+  BASIC_AUTH_USER: ${{ vars.BASIC_AUTH_USER || 'spectrum' }}
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    # Referencing an environment that does not exist creates it automatically,
+    # so this is idempotent GitHub-environment provisioning with no extra token.
+    environment: ${{ inputs.environment }}
+    env:
+      DEPLOY_ENV: ${{ inputs.environment }}
+      DEPLOY_BRANCH: ${{ inputs.branch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Resolve resource names
+        id: names
+        run: |
+          set -euo pipefail
+          case "$DEPLOY_ENV" in
+            dev|stg|prod) ;;
+            *) echo "::error::Unknown environment '$DEPLOY_ENV' (expected dev, stg or prod)."; exit 1 ;;
+          esac
+          NAME="${ORG_TAG}-${PROJECT_ID}-${DEPLOY_ENV}"          # tw-spectrum-livepreview-prod
+          if [ "$DEPLOY_ENV" = "prod" ]; then
+            SUBDOMAIN="${PROJECT_ID}"                          # spectrum-livepreview
+          else
+            SUBDOMAIN="${PROJECT_ID}-${DEPLOY_ENV}"            # spectrum-livepreview-dev
+          fi
+          FQDN="${SUBDOMAIN}.${CUSTOM_DOMAIN_BASE}"           # spectrum-livepreview.thrillworks.site
+          {
+            echo "name=$NAME"
+            echo "fqdn=$FQDN"
+            echo "ssm_prefix=/${ORG_TAG}/${PROJECT_ID}/${DEPLOY_ENV}"
+            echo "image_tag=${GITHUB_SHA::12}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resource name : $NAME"
+          echo "Custom domain : $FQDN"
+          echo "SSM prefix    : /${ORG_TAG}/${PROJECT_ID}/${DEPLOY_ENV}"
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # --- Quality gates (informational on deploy; enforced in PR checks) ---
+      - name: Dependency audit
+        continue-on-error: true
+        run: |
+          echo "## Dependency audit (${DEPLOY_ENV})" >> "$GITHUB_STEP_SUMMARY"
+          npm audit --audit-level=high || echo "_Advisories found - see log; non-blocking on deploy._" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Lint
+        continue-on-error: true
+        run: npx eslint
+
+      # Blocking: it takes seconds, and a direct push to a trunk branch skips PR checks.
+      - name: Typecheck
+        run: |
+          npx next typegen
+          npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm test
+
+      # Pages are prerendered from Contentful during the build, so the build needs the
+      # same space and delivery token the server uses at runtime.
+      - name: Build image context
+        env:
+          CONTENTFUL_SPACE_ID: ${{ secrets.CONTENTFUL_SPACE_ID }}
+          CONTENTFUL_ENVIRONMENT: ${{ secrets.CONTENTFUL_ENVIRONMENT || 'master' }}
+          CONTENTFUL_DELIVERY_TOKEN: ${{ secrets.CONTENTFUL_DELIVERY_TOKEN }}
+          CONTENTFUL_PREVIEW_TOKEN: ${{ secrets.CONTENTFUL_PREVIEW_TOKEN }}
+        run: |
+          if [ -z "$CONTENTFUL_SPACE_ID" ] || [ -z "$CONTENTFUL_DELIVERY_TOKEN" ]; then
+            echo "::warning::CONTENTFUL_SPACE_ID or CONTENTFUL_DELIVERY_TOKEN is not set in GitHub secrets. The site will show the 'Connect Contentful' notice."
+          fi
+          bash .github/scripts/build-image-context.sh
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve AWS account
+        id: aws
+        run: echo "account=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure ECR repository
+        id: ecr
+        env:
+          NAME: ${{ steps.names.outputs.name }}
+          ACCOUNT: ${{ steps.aws.outputs.account }}
+        run: |
+          set -euo pipefail
+          if ! aws ecr describe-repositories --repository-names "$NAME" >/dev/null 2>/tmp/ecr_err; then
+            if ! grep -q RepositoryNotFoundException /tmp/ecr_err; then cat /tmp/ecr_err; exit 1; fi
+            echo "Creating ECR repository $NAME"
+            aws ecr create-repository \
+              --repository-name "$NAME" \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability MUTABLE \
+              --tags Key=org,Value="$ORG_TAG" Key=project,Value="$PROJECT_ID" Key=environment,Value="$DEPLOY_ENV" Key=ManagedBy,Value=github-actions >/dev/null
+          else
+            echo "ECR repository $NAME already exists"
+          fi
+          # Keep the 30 most recent images; older ones are never deployed again.
+          aws ecr put-lifecycle-policy --repository-name "$NAME" --lifecycle-policy-text '{
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep the 30 most recent images",
+              "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30 },
+              "action": { "type": "expire" }
+            }]
+          }' >/dev/null
+          echo "registry=${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push image
+        id: image
+        env:
+          NAME: ${{ steps.names.outputs.name }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ steps.names.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/$NAME:$TAG"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+          docker build -t "$IMAGE" -t "$REGISTRY/$NAME:$DEPLOY_ENV" .
+          docker push "$IMAGE"
+          docker push "$REGISTRY/$NAME:$DEPLOY_ENV"
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure App Runner ECR access role
+        id: access_role
+        run: |
+          set -euo pipefail
+          # Shared by every App Runner service in the account.
+          ROLE_NAME="AppRunnerECRAccessRole"
+          if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>/tmp/iam_err; then
+            if ! grep -q NoSuchEntity /tmp/iam_err; then cat /tmp/iam_err; exit 1; fi
+            echo "Creating IAM role $ROLE_NAME"
+            aws iam create-role --role-name "$ROLE_NAME" \
+              --description "Allows AWS App Runner to pull images from ECR (managed by github-actions)" \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [{
+                  "Effect": "Allow",
+                  "Principal": { "Service": "build.apprunner.amazonaws.com" },
+                  "Action": "sts:AssumeRole"
+                }]
+              }' >/dev/null
+            aws iam attach-role-policy --role-name "$ROLE_NAME" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+            echo "Waiting for IAM role propagation..."
+            sleep 10
+          else
+            echo "IAM role $ROLE_NAME already exists"
+          fi
+          echo "arn=$(aws iam get-role --role-name "$ROLE_NAME" --query Role.Arn --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure application secrets
+        id: secrets
+        env:
+          SSM_PREFIX: ${{ steps.names.outputs.ssm_prefix }}
+          ACCOUNT: ${{ steps.aws.outputs.account }}
+          GH_CONTENTFUL_DELIVERY_TOKEN: ${{ secrets.CONTENTFUL_DELIVERY_TOKEN }}
+          GH_CONTENTFUL_PREVIEW_TOKEN: ${{ secrets.CONTENTFUL_PREVIEW_TOKEN }}
+          GH_CONTENTFUL_PREVIEW_SECRET: ${{ secrets.CONTENTFUL_PREVIEW_SECRET }}
+          GH_CONTENTFUL_REVALIDATE_SECRET: ${{ secrets.CONTENTFUL_REVALIDATE_SECRET }}
+          GH_BASIC_AUTH_PASSWORD: ${{ secrets.BASIC_AUTH_PASSWORD }}
+        run: |
+          set -euo pipefail
+          TAGS="Key=org,Value=$ORG_TAG Key=project,Value=$PROJECT_ID Key=environment,Value=$DEPLOY_ENV Key=ManagedBy,Value=github-actions"
+          ssm_exists() {
+            if aws ssm get-parameter --name "$1" --query Parameter.Name --output text >/dev/null 2>/tmp/ssm_err; then return 0; fi
+            if grep -q ParameterNotFound /tmp/ssm_err; then return 1; fi
+            cat /tmp/ssm_err >&2; return 2
+          }
+          ssm_put() {
+            aws ssm put-parameter --name "$1" --type SecureString --value "$2" --overwrite >/dev/null
+            aws ssm add-tags-to-resource --resource-type Parameter --resource-id "$1" --tags $TAGS >/dev/null
+          }
+          arn() { echo "arn:aws:ssm:${AWS_REGION}:${ACCOUNT}:parameter$1"; }
+
+          # Map of runtime variable name -> SSM parameter ARN, handed to App Runner.
+          MAP='{}'
+          add() { MAP=$(echo "$MAP" | jq --arg k "$1" --arg v "$(arn "$SSM_PREFIX/$1")" '. + {($k): $v}'); }
+
+          # Contentful tokens: GitHub is the source of truth. A secret that is not set in
+          # GitHub is not passed to the app at all.
+          for KEY in CONTENTFUL_DELIVERY_TOKEN CONTENTFUL_PREVIEW_TOKEN; do
+            VAR="GH_$KEY"
+            if [ -n "${!VAR}" ]; then
+              ssm_put "$SSM_PREFIX/$KEY" "${!VAR}"
+              add "$KEY"
+              echo "$KEY: from GitHub secret"
+            else
+              echo "::warning::$KEY is not set in GitHub secrets - not passed to the app"
+            fi
+          done
+
+          # Preview, revalidate and basic auth secrets: a GitHub secret wins when set;
+          # otherwise one is generated once and kept, so the URL configured in Contentful
+          # and the password people were given survive redeploys.
+          for KEY in CONTENTFUL_PREVIEW_SECRET CONTENTFUL_REVALIDATE_SECRET BASIC_AUTH_PASSWORD; do
+            VAR="GH_$KEY"
+            if [ -n "${!VAR}" ]; then
+              ssm_put "$SSM_PREFIX/$KEY" "${!VAR}"
+              echo "$KEY: from GitHub secret"
+            else
+              set +e; ssm_exists "$SSM_PREFIX/$KEY"; rc=$?; set -e
+              case $rc in
+                0) echo "$KEY: existing generated value kept" ;;
+                1) ssm_put "$SSM_PREFIX/$KEY" "$(openssl rand -hex 24)"; echo "$KEY: generated" ;;
+                *) echo "::error::Could not read $SSM_PREFIX/$KEY"; exit 1 ;;
+              esac
+            fi
+            add "$KEY"
+          done
+
+          echo "map=$(echo "$MAP" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure App Runner instance role
+        id: instance_role
+        env:
+          NAME: ${{ steps.names.outputs.name }}
+          SSM_PREFIX: ${{ steps.names.outputs.ssm_prefix }}
+          ACCOUNT: ${{ steps.aws.outputs.account }}
+        run: |
+          set -euo pipefail
+          ROLE_NAME="${NAME}-apprunner-instance"
+          if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>/tmp/iam_err; then
+            if ! grep -q NoSuchEntity /tmp/iam_err; then cat /tmp/iam_err; exit 1; fi
+            echo "Creating IAM role $ROLE_NAME"
+            aws iam create-role --role-name "$ROLE_NAME" \
+              --description "Runtime role for the ${NAME} App Runner service (managed by github-actions)" \
+              --tags Key=org,Value="$ORG_TAG" Key=project,Value="$PROJECT_ID" Key=environment,Value="$DEPLOY_ENV" Key=ManagedBy,Value=github-actions \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [{
+                  "Effect": "Allow",
+                  "Principal": { "Service": "tasks.apprunner.amazonaws.com" },
+                  "Action": "sts:AssumeRole"
+                }]
+              }' >/dev/null
+            CREATED=true
+          else
+            echo "IAM role $ROLE_NAME already exists"
+            CREATED=false
+          fi
+
+          # Converged on every run: read this environment's parameters only.
+          POLICY=$(jq -n \
+            --arg params "arn:aws:ssm:${AWS_REGION}:${ACCOUNT}:parameter${SSM_PREFIX}/*" \
+            --arg via "ssm.${AWS_REGION}.amazonaws.com" \
+            '{
+               Version: "2012-10-17",
+               Statement: [
+                 { Sid: "ReadEnvironmentParameters", Effect: "Allow", Action: ["ssm:GetParameters", "ssm:GetParameter"], Resource: $params },
+                 { Sid: "DecryptParametersViaSsm", Effect: "Allow", Action: "kms:Decrypt", Resource: "*",
+                   Condition: { StringEquals: { "kms:ViaService": $via } } }
+               ]
+             }')
+          aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name runtime --policy-document "$POLICY"
+          if [ "$CREATED" = "true" ]; then
+            echo "Waiting for IAM role propagation..."
+            sleep 15
+          fi
+          echo "arn=$(aws iam get-role --role-name "$ROLE_NAME" --query Role.Arn --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure auto scaling configuration
+        id: scaling
+        env:
+          NAME: ${{ steps.names.outputs.name }}
+        run: |
+          set -euo pipefail
+          # Exactly one instance (see the header). Configurations are immutable, so an
+          # existing revision is reused as-is.
+          ARN=$(aws apprunner list-auto-scaling-configurations --auto-scaling-configuration-name "$NAME" --latest-only --output json \
+            | jq -r '[.AutoScalingConfigurationSummaryList[] | select(.Status == "active")][0].AutoScalingConfigurationArn // empty')
+          if [ -n "$ARN" ]; then
+            echo "Auto scaling configuration $NAME already exists"
+          else
+            echo "Creating auto scaling configuration $NAME (min 1, max 1)"
+            ARN=$(aws apprunner create-auto-scaling-configuration \
+              --auto-scaling-configuration-name "$NAME" \
+              --min-size 1 --max-size 1 --max-concurrency 100 \
+              --tags Key=org,Value="$ORG_TAG" Key=project,Value="$PROJECT_ID" Key=environment,Value="$DEPLOY_ENV" Key=ManagedBy,Value=github-actions \
+              --query AutoScalingConfiguration.AutoScalingConfigurationArn --output text)
+          fi
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure & deploy App Runner service
+        id: service
+        env:
+          NAME: ${{ steps.names.outputs.name }}
+          IMAGE: ${{ steps.image.outputs.uri }}
+          ACCESS_ROLE: ${{ steps.access_role.outputs.arn }}
+          INSTANCE_ROLE: ${{ steps.instance_role.outputs.arn }}
+          SCALING_ARN: ${{ steps.scaling.outputs.arn }}
+          SECRETS_MAP: ${{ steps.secrets.outputs.map }}
+          CONTENTFUL_SPACE_ID: ${{ secrets.CONTENTFUL_SPACE_ID }}
+          CONTENTFUL_ENVIRONMENT: ${{ secrets.CONTENTFUL_ENVIRONMENT || 'master' }}
+        run: |
+          set -euo pipefail
+
+          ARN=$(aws apprunner list-services --output json | jq -r --arg n "$NAME" \
+            '[.ServiceSummaryList[] | select(.ServiceName == $n)][0].ServiceArn // empty')
+
+          # A service stuck in a terminal failed state cannot be updated or
+          # recovered - delete it and recreate from scratch (self-heal).
+          if [ -n "$ARN" ]; then
+            CUR=$(aws apprunner describe-service --service-arn "$ARN" --query Service.Status --output text)
+            if [ "$CUR" = "CREATE_FAILED" ] || [ "$CUR" = "DELETE_FAILED" ]; then
+              echo "Service is $CUR - deleting to recreate"
+              aws apprunner delete-service --service-arn "$ARN" >/dev/null || true
+              for i in $(seq 1 60); do
+                D=$(aws apprunner list-services --output json | jq -r --arg n "$NAME" '[.ServiceSummaryList[] | select(.ServiceName == $n)][0].Status // empty')
+                if [ -z "$D" ]; then echo "  deleted"; break; fi
+                echo "  waiting for delete ($D)..."; sleep 10
+              done
+              ARN=""
+            fi
+          fi
+
+          SOURCE_CFG=$(jq -n \
+            --arg img "$IMAGE" \
+            --arg role "$ACCESS_ROLE" \
+            --arg port "$CONTAINER_PORT" \
+            --argjson secrets "$SECRETS_MAP" \
+            --arg spaceId "${CONTENTFUL_SPACE_ID:-}" \
+            --arg cfEnv "$CONTENTFUL_ENVIRONMENT" \
+            --arg authUser "$BASIC_AUTH_USER" \
+            '{
+               ImageRepository: {
+                 ImageIdentifier: $img,
+                 ImageRepositoryType: "ECR",
+                 ImageConfiguration: {
+                   Port: $port,
+                   RuntimeEnvironmentVariables: ({
+                     NODE_ENV: "production",
+                     CONTENTFUL_SPACE_ID: $spaceId,
+                     CONTENTFUL_ENVIRONMENT: $cfEnv,
+                     BASIC_AUTH_USER: $authUser
+                   } | with_entries(select(.value != ""))),
+                   RuntimeEnvironmentSecrets: $secrets
+                 }
+               },
+               AutoDeploymentsEnabled: false,
+               AuthenticationConfiguration: { AccessRoleArn: $role }
+             }')
+          INSTANCE_CFG=$(jq -n --arg cpu "$APPRUNNER_CPU" --arg mem "$APPRUNNER_MEMORY" --arg role "$INSTANCE_ROLE" \
+            '{Cpu: $cpu, Memory: $mem, InstanceRoleArn: $role}')
+          NETWORK_CFG='{"EgressConfiguration":{"EgressType":"DEFAULT"},"IngressConfiguration":{"IsPubliclyAccessible":true}}'
+          # robots.txt is a static route, so a 200 there means the server is up
+          # without depending on Contentful being reachable.
+          HEALTH_CFG='{"Protocol":"HTTP","Path":"/robots.txt","Interval":10,"Timeout":5,"HealthyThreshold":1,"UnhealthyThreshold":5}'
+
+          # Track the DEPLOYMENT OPERATION to a terminal state - NOT Service.Status,
+          # which returns to RUNNING even after a failed-health-check ROLLBACK. A
+          # rollback means the new revision was rejected and the OLD image is still
+          # serving, so it must fail the pipeline. Budget 30 min (120 x 15s).
+          track_operation() {
+            local op_id="$1" op_status="" svc_status
+            echo "Tracking deployment operation $op_id ..."
+            for i in $(seq 1 120); do
+              op_status=$(aws apprunner list-operations --service-arn "$ARN" --output json | jq -r --arg id "$op_id" \
+                '[.OperationSummaryList[] | select(.Id == $id)][0].Status // "UNKNOWN"')
+              svc_status=$(aws apprunner describe-service --service-arn "$ARN" --query Service.Status --output text)
+              echo "  [$i] operation=$op_status service=$svc_status"
+              case "$svc_status" in
+                CREATE_FAILED|DELETE_FAILED) echo "::error::Service entered $svc_status"; exit 1 ;;
+              esac
+              case "$op_status" in
+                SUCCEEDED) return 0 ;;
+                FAILED|ROLLBACK_FAILED|ROLLBACK_SUCCEEDED)
+                  echo "::error::Deployment ended as $op_status - the new revision failed to start or failed its health check, and App Runner kept the PREVIOUS image. Check the App Runner application logs."
+                  exit 1 ;;
+                *) sleep 15 ;;
+              esac
+            done
+            echo "::error::Deployment operation did not reach SUCCEEDED within 30 min (last: $op_status)."
+            exit 1
+          }
+
+          update_service() {
+            # App Runner serializes operations on a service: UpdateService is rejected
+            # (InvalidStateException) while a prior create or deploy is still settling.
+            local cur upd
+            for attempt in $(seq 1 120); do
+              cur=$(aws apprunner describe-service --service-arn "$ARN" --query Service.Status --output text)
+              case "$cur" in
+                RUNNING) : ;;
+                CREATE_FAILED|DELETE_FAILED|PAUSED) echo "::error::Service in $cur - cannot update"; exit 1 ;;
+                *) echo "  service busy ($cur) - waiting 15s before update..."; sleep 15; continue ;;
+              esac
+              if upd=$(aws apprunner update-service --service-arn "$ARN" \
+                   --source-configuration "$SOURCE_CFG" \
+                   --instance-configuration "$INSTANCE_CFG" \
+                   --network-configuration "$NETWORK_CFG" \
+                   --health-check-configuration "$HEALTH_CFG" \
+                   --auto-scaling-configuration-arn "$SCALING_ARN" \
+                   --output json 2>/tmp/upd_err); then
+                track_operation "$(echo "$upd" | jq -r '.OperationId')"
+                return 0
+              fi
+              if grep -q "InvalidStateException" /tmp/upd_err; then
+                echo "  update rejected (operation in progress) - waiting 15s..."; sleep 15; continue
+              fi
+              echo "::error::update-service failed:"; cat /tmp/upd_err; exit 1
+            done
+            echo "::error::Service never became updatable."; exit 1
+          }
+
+          if [ -z "$ARN" ]; then
+            echo "Creating App Runner service $NAME"
+            CREATE_JSON=$(aws apprunner create-service \
+              --service-name "$NAME" \
+              --source-configuration "$SOURCE_CFG" \
+              --instance-configuration "$INSTANCE_CFG" \
+              --network-configuration "$NETWORK_CFG" \
+              --health-check-configuration "$HEALTH_CFG" \
+              --auto-scaling-configuration-arn "$SCALING_ARN" \
+              --tags Key=org,Value="$ORG_TAG" Key=project,Value="$PROJECT_ID" Key=environment,Value="$DEPLOY_ENV" Key=ManagedBy,Value=github-actions \
+              --output json)
+            ARN=$(echo "$CREATE_JSON" | jq -r '.Service.ServiceArn')
+            track_operation "$(echo "$CREATE_JSON" | jq -r '.OperationId')"
+          else
+            echo "Updating App Runner service $NAME ($ARN)"
+            update_service
+          fi
+
+          {
+            echo "arn=$ARN"
+            echo "service_url=https://$(aws apprunner describe-service --service-arn "$ARN" --query Service.ServiceUrl --output text)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ensure custom domain & TLS
+        id: domain
+        if: env.ENABLE_CUSTOM_DOMAIN == 'true'
+        env:
+          ARN: ${{ steps.service.outputs.arn }}
+          FQDN: ${{ steps.names.outputs.fqdn }}
+        run: |
+          set -euo pipefail
+          STATUS=$(aws apprunner describe-custom-domains --service-arn "$ARN" --output json | jq -r --arg d "$FQDN" \
+            '[.CustomDomains[] | select(.DomainName == $d)][0].Status // empty')
+
+          if [ -z "$STATUS" ]; then
+            echo "Associating custom domain $FQDN"
+            # App Runner rejects AssociateCustomDomain while the service is still
+            # settling (InvalidStateException). Retry through it rather than failing.
+            for attempt in $(seq 1 10); do
+              if aws apprunner associate-custom-domain \
+                   --service-arn "$ARN" --domain-name "$FQDN" --no-enable-www-subdomain \
+                   >/dev/null 2>/tmp/assoc_err; then
+                break
+              fi
+              if grep -q "InvalidStateException" /tmp/assoc_err; then
+                echo "  service not ready for domain association (attempt $attempt) - waiting 20s..."
+                sleep 20
+                continue
+              fi
+              echo "::error::associate-custom-domain failed:"; cat /tmp/assoc_err; exit 1
+            done
+            sleep 5
+          else
+            echo "Custom domain $FQDN already associated (status=$STATUS)"
+          fi
+
+          # App Runner publishes CertificateValidationRecords a few seconds AFTER
+          # association. Poll until they appear, otherwise only the subdomain CNAME is
+          # written and the certificate never validates.
+          DNS_TARGET=""; RECORDS="[]"
+          for i in $(seq 1 24); do
+            DOMAIN_JSON=$(aws apprunner describe-custom-domains --service-arn "$ARN" --output json)
+            DNS_TARGET=$(echo "$DOMAIN_JSON" | jq -r '.DNSTarget')
+            RECORDS=$(echo "$DOMAIN_JSON" | jq -c --arg fqdn "$FQDN" \
+              '[.CustomDomains[] | select(.DomainName == $fqdn) | .CertificateValidationRecords // []] | add // []')
+            CNT=$(echo "$RECORDS" | jq 'length')
+            echo "  [$i] DNSTarget=$DNS_TARGET  validation records=$CNT"
+            [ "$CNT" -gt 0 ] && break
+            sleep 5
+          done
+          if [ "$(echo "$RECORDS" | jq 'length')" -eq 0 ]; then
+            echo "::warning::App Runner has not yet published certificate validation records; a later run will write them."
+          fi
+
+          HZ=$(aws route53 list-hosted-zones-by-name --dns-name "${CUSTOM_DOMAIN_BASE}." --output json | jq -r --arg n "${CUSTOM_DOMAIN_BASE}." \
+            '[.HostedZones[] | select(.Name == $n and .Config.PrivateZone == false)][0].Id // empty')
+          if [ -z "$HZ" ]; then
+            echo "::warning::No public Route 53 hosted zone for ${CUSTOM_DOMAIN_BASE} in this account - skipping DNS. The app is reachable at the App Runner URL."
+            echo "domain_status=NO_HOSTED_ZONE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGES=$(jq -n --arg fqdn "$FQDN" --arg target "$DNS_TARGET" --argjson records "$RECORDS" \
+            '{
+               Changes: (
+                 ($records | map({
+                   Action: "UPSERT",
+                   ResourceRecordSet: { Name: .Name, Type: .Type, TTL: 300, ResourceRecords: [{ Value: .Value }] }
+                 }))
+                 + [{
+                   Action: "UPSERT",
+                   ResourceRecordSet: { Name: $fqdn, Type: "CNAME", TTL: 300, ResourceRecords: [{ Value: $target }] }
+                 }]
+               )
+             }')
+          echo "$CHANGES" > /tmp/r53-changes.json
+          aws route53 change-resource-record-sets --hosted-zone-id "$HZ" --change-batch file:///tmp/r53-changes.json >/dev/null
+          echo "Upserted Route 53 records (DNS target: $DNS_TARGET)"
+
+          FINAL="pending"
+          for i in $(seq 1 40); do
+            S=$(aws apprunner describe-custom-domains --service-arn "$ARN" --output json | jq -r --arg d "$FQDN" \
+              '[.CustomDomains[] | select(.DomainName == $d)][0].Status // "unknown"')
+            echo "  [$i] custom-domain status=$S"
+            FINAL="$S"
+            [ "$S" = "active" ] && break
+            sleep 15
+          done
+          echo "domain_status=$FINAL" >> "$GITHUB_OUTPUT"
+          if [ "$FINAL" != "active" ]; then
+            echo "::warning::Custom domain not yet active (status=$FINAL). DNS/cert validation can take longer than this run; a later run will converge it."
+          fi
+
+      - name: Smoke test
+        env:
+          SERVICE_URL: ${{ steps.service.outputs.service_url }}
+          SSM_PREFIX: ${{ steps.names.outputs.ssm_prefix }}
+        run: |
+          set -euo pipefail
+          # Probes the App Runner URL, which works before the custom domain's certificate is issued.
+          fail() { echo "::error::$1"; exit 1; }
+          code() { curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$@"; }
+          ssm() { aws ssm get-parameter --name "$SSM_PREFIX/$1" --with-decryption --query Parameter.Value --output text; }
+          PW=$(ssm BASIC_AUTH_PASSWORD); echo "::add-mask::$PW"
+          SECRET=$(ssm CONTENTFUL_PREVIEW_SECRET); echo "::add-mask::$SECRET"
+          [ -n "$PW" ] && [ -n "$SECRET" ] || fail "Could not read the basic auth password or preview secret from SSM."
+
+          # --- Basic auth gate ---
+          # Headers are captured into a variable before matching: `curl | grep -q` under
+          # pipefail fails when grep exits early and curl gets SIGPIPE.
+          C=$(code "$SERVICE_URL/"); echo "GET / without credentials -> $C"
+          [ "$C" = "401" ] || fail "/ answered $C without credentials - the basic auth gate is not active."
+          H=$(curl -s -D - -o /dev/null --max-time 30 "$SERVICE_URL/")
+          grep -qi '^www-authenticate: basic' <<<"$H" || fail "The 401 has no Basic challenge."
+          C=$(code -u "$BASIC_AUTH_USER:wrong-password" "$SERVICE_URL/"); echo "GET / with a wrong password -> $C"
+          [ "$C" = "401" ] || fail "/ accepted a wrong password ($C)."
+          C=$(curl -s -o /tmp/home.html -w '%{http_code}' --max-time 30 -u "$BASIC_AUTH_USER:$PW" "$SERVICE_URL/")
+          echo "GET / with credentials -> $C"
+          [ "$C" = "200" ] || fail "/ returned $C with the right credentials."
+          if grep -q "Connect Contentful" /tmp/home.html; then
+            echo "::warning::/ shows the 'Connect Contentful' notice - the Contentful secrets were not available to the build."
+          fi
+          C=$(code "$SERVICE_URL/robots.txt"); echo "GET /robots.txt without credentials -> $C"
+          [ "$C" = "200" ] || fail "/robots.txt returned $C; it is the health check and must stay open."
+
+          # --- Preview link: what the Contentful iframe does, with no Basic credentials ---
+          C=$(code "$SERVICE_URL/api/draft?secret=wrong"); echo "GET /api/draft?secret=wrong -> $C"
+          [ "$C" = "401" ] || fail "/api/draft accepted a wrong secret ($C)."
+          # Opened in a tab, the link must not unlock the site: no access cookie.
+          HDRS=$(curl -s -D - -o /dev/null --max-time 20 -H 'Sec-Fetch-Dest: document' "$SERVICE_URL/api/draft?secret=$SECRET&slug=home" | tr -d '\r')
+          ! grep -qi '^set-cookie: preview_access=' <<<"$HDRS" || fail "/api/draft opened in a tab set the access cookie; only a frame should get it."
+          grep -qi '^set-cookie: __prerender_bypass=' <<<"$HDRS" || fail "/api/draft opened in a tab did not enable draft mode."
+          echo "GET /api/draft in a tab -> draft mode only, no access cookie"
+          # Loaded in a frame, as Contentful's pane does, it sets both cookies.
+          HDRS=$(curl -s -D - -o /dev/null --max-time 20 -H 'Sec-Fetch-Dest: iframe' "$SERVICE_URL/api/draft?secret=$SECRET&slug=home" | tr -d '\r')
+          DRAFT=$(echo "$HDRS" | grep -i '^set-cookie: __prerender_bypass=' | tail -1)
+          ACCESS=$(echo "$HDRS" | grep -i '^set-cookie: preview_access=' | tail -1)
+          [ -n "$DRAFT" ] || fail "/api/draft did not set the draft mode cookie."
+          [ -n "$ACCESS" ] || fail "/api/draft did not set the preview access cookie."
+          for COOKIE in "$DRAFT" "$ACCESS"; do
+            grep -qi 'partitioned' <<<"$COOKIE" || fail "A preview cookie is not Partitioned, so browsers that block third-party cookies will drop it."
+            grep -qi 'samesite=none' <<<"$COOKIE" || fail "A preview cookie is not SameSite=None."
+          done
+          JAR="$(echo "$DRAFT" | sed -E 's/^set-cookie: ([^;]+).*/\1/I'); $(echo "$ACCESS" | sed -E 's/^set-cookie: ([^;]+).*/\1/I')"
+          C=$(code -H "Cookie: $JAR" "$SERVICE_URL/"); echo "GET / with the preview cookies only -> $C"
+          [ "$C" = "200" ] || fail "The preview cookies did not pass the gate ($C)."
+          H=$(curl -s -D - -o /dev/null --max-time 30 -H "Cookie: $JAR" "$SERVICE_URL/")
+          grep -qi '^cache-control: private, no-cache, no-store' <<<"$H" \
+            || fail "The preview cookies passed the gate but draft mode is not active."
+          echo "Basic auth gate and preview link verified"
+
+      - name: Deployment summary
+        if: always()
+        env:
+          NAME: ${{ steps.names.outputs.name }}
+          FQDN: ${{ steps.names.outputs.fqdn }}
+          IMAGE: ${{ steps.image.outputs.uri }}
+          SERVICE_URL: ${{ steps.service.outputs.service_url }}
+          DOMAIN_STATUS: ${{ steps.domain.outputs.domain_status || 'disabled' }}
+          SSM_PREFIX: ${{ steps.names.outputs.ssm_prefix }}
+          TAG: ${{ steps.names.outputs.image_tag }}
+        run: |
+          {
+            echo "## Deploy - ${DEPLOY_ENV}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Service** | \`${NAME}\` |"
+            echo "| **Image** | \`${IMAGE}\` |"
+            echo "| **App Runner URL** | ${SERVICE_URL} |"
+            echo "| **Custom domain** | https://${FQDN} (\`${DOMAIN_STATUS}\`) |"
+            echo "| **Contentful preview URL** | \`https://${FQDN}/api/draft?secret=<CONTENTFUL_PREVIEW_SECRET>&slug={entry.fields.slug}\` |"
+            echo "| **Basic auth** | user \`${BASIC_AUTH_USER}\`, password in SSM \`${SSM_PREFIX}/BASIC_AUTH_PASSWORD\` |"
+            echo "| **Contentful webhook** | \`POST https://${FQDN}/api/revalidate\` with header \`x-revalidate-secret: <CONTENTFUL_REVALIDATE_SECRET>\` |"
+            echo "| **Runtime secrets** | SSM \`${SSM_PREFIX}/*\` |"
+            echo "| **Branch / SHA** | \`${DEPLOY_BRANCH}\` @ \`${TAG}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
