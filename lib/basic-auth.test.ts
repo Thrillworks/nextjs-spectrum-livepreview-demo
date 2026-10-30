@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   BASIC_AUTH_REALM,
@@ -5,6 +6,7 @@ import {
   hasPreviewAccess,
   isAuthorized,
   isBasicAuthEnabled,
+  isFramedRequest,
   isUngatedPath,
   parseAuthorizationHeader,
   previewAccessToken,
@@ -95,6 +97,20 @@ describe("preview access cookie", () => {
   it("is never valid when no password is configured", () => {
     expect(previewAccessToken({})).toBe("");
     expect(hasPreviewAccess("", {})).toBe(false);
+  });
+
+  // v1 cookies were also issued to tabs that opened the preview link directly.
+  it("rejects cookies issued under the previous version", () => {
+    const v1 = createHmac("sha256", ENV.BASIC_AUTH_PASSWORD).update("spectrum-preview-access-v1").digest("hex");
+    expect(hasPreviewAccess(v1, ENV)).toBe(false);
+  });
+});
+
+describe("isFramedRequest", () => {
+  it("is true only for a frame load", () => {
+    expect(isFramedRequest(new Headers({ "sec-fetch-dest": "iframe" }))).toBe(true);
+    expect(isFramedRequest(new Headers({ "sec-fetch-dest": "document" }))).toBe(false);
+    expect(isFramedRequest(new Headers())).toBe(false);
   });
 });
 

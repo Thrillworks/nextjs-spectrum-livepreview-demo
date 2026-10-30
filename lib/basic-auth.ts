@@ -10,6 +10,10 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 // accepts in place of Basic credentials. Partitioned (CHIPS) cookies are kept in a
 // cross-site iframe even when third-party cookies are blocked.
 //
+// The access cookie is only set when the preview link loads inside an iframe. Opened
+// in a tab, the link enables draft mode but the browser still has to sign in, so the
+// link cannot be used to unlock the site outside Contentful.
+//
 // Defaults: on in production, off in `next dev`. BASIC_AUTH_ENABLED=true|false
 // overrides either way. With the gate on and no BASIC_AUTH_PASSWORD configured,
 // every gated request is refused rather than let through.
@@ -91,11 +95,21 @@ export function isAuthorized(header: string | null, env: Env = process.env): boo
 }
 
 // The cookie value is derived from the password, so changing the password revokes
-// every issued cookie, and the value cannot be produced without knowing it.
+// every issued cookie, and the value cannot be produced without knowing it. Bumping
+// the version also revokes them: v1 cookies were issued to top-level visits too.
+export const PREVIEW_ACCESS_VERSION = "spectrum-preview-access-v2";
+
 export function previewAccessToken(env: Env = process.env): string {
   const { password } = basicAuthCredentials(env);
   if (!password) return "";
-  return createHmac("sha256", password).update("spectrum-preview-access-v1").digest("hex");
+  return createHmac("sha256", password).update(PREVIEW_ACCESS_VERSION).digest("hex");
+}
+
+// Browsers send Sec-Fetch-Dest: iframe when a frame loads the URL, as Contentful's
+// preview pane does, and "document" for a tab. A request without the header is
+// treated as a tab, which only means the browser is asked to sign in.
+export function isFramedRequest(headers: Headers): boolean {
+  return headers.get("sec-fetch-dest") === "iframe";
 }
 
 export function hasPreviewAccess(cookieValue: string | undefined, env: Env = process.env): boolean {
