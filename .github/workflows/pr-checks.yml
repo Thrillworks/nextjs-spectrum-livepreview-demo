@@ -1,7 +1,7 @@
 name: PR Checks
 
 # Runs on every pull request targeting the trunk branch. The production dependency
-# audit, lint, typecheck and the production image build are blocking. The full
+# audit, lint, typecheck, unit tests and the production image build are blocking. The full
 # dependency audit and Semgrep SAST are report-only.
 
 on:
@@ -47,6 +47,9 @@ jobs:
           npx next typegen
           npx tsc --noEmit
 
+      - name: Unit tests
+        run: npm test
+
       - name: SAST (Semgrep)
         id: sast
         continue-on-error: true
@@ -81,7 +84,7 @@ jobs:
             echo "## PR Checks"
             echo ""
             echo "- **Branch**: ${HEAD_REF} -> ${BASE_REF}"
-            echo "- **Production audit / Lint / Typecheck / Build**: ${JOB_STATUS}"
+            echo "- **Production audit / Lint / Typecheck / Unit tests / Build**: ${JOB_STATUS}"
             echo "- **Full dependency audit**: ${AUDIT_ALL} (report-only)"
             echo "- **SAST (Semgrep)**: ${SAST} (report-only)"
           } >> "$GITHUB_STEP_SUMMARY"

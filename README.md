@@ -70,7 +70,14 @@ The pipeline reads these GitHub secrets:
 | `CONTENTFUL_SPACE_ID`, `CONTENTFUL_ENVIRONMENT` | Space and environment, used at build time and at runtime |
 | `CONTENTFUL_DELIVERY_TOKEN`, `CONTENTFUL_PREVIEW_TOKEN` | Content Delivery and Content Preview API tokens |
 | `CONTENTFUL_PREVIEW_SECRET`, `CONTENTFUL_REVALIDATE_SECRET` | Optional. When unset, a value is generated once and kept in SSM |
+| `BASIC_AUTH_PASSWORD` | Optional. When unset, a value is generated once and kept in SSM. The user is `spectrum`, or the `BASIC_AUTH_USER` variable |
 
 Pages are prerendered from Contentful during the build, so a change to the space ID or delivery token needs a redeploy (re-run **Deploy Production** from the Actions tab). The service runs exactly one instance because the Next.js data cache is held on the instance, and a revalidation webhook reaches only one instance.
 
 In Contentful, set the preview URL to `https://spectrum-livepreview.thrillworks.site/api/draft?secret=<CONTENTFUL_PREVIEW_SECRET>&slug={entry.fields.slug}`.
+
+## Basic auth
+
+The deployed site asks for a username and password (`proxy.ts`, `lib/basic-auth.ts`), so it is neither public nor crawlable. Three paths stay open because each has its own check or serves nothing private: `/robots.txt` (the App Runner health check), `/api/draft` (checks the preview secret) and `/api/revalidate` (checks the webhook secret).
+
+The Contentful preview pane loads the site in a cross-site iframe. In a normal Chrome window the browser shows the password prompt inside the pane. In incognito, and in browsers that block third-party cookies, Chrome shows no prompt and the pane displays only "Authentication required." To cover those cases, the preview URL sets a `preview_access` cookie that the gate accepts instead of the password, and sets the draft mode cookie again. Both cookies are `Partitioned`, which browsers keep in a cross-site iframe even when third-party cookies are blocked. The access cookie is derived from the password, so changing `BASIC_AUTH_PASSWORD` revokes every issued cookie.
