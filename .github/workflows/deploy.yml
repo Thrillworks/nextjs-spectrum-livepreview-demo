@@ -51,6 +51,9 @@ env:
   APPRUNNER_CPU: ${{ vars.APPRUNNER_CPU || '0.25 vCPU' }}
   APPRUNNER_MEMORY: ${{ vars.APPRUNNER_MEMORY || '0.5 GB' }}
   CONTAINER_PORT: '3000'
+  # Basic auth user. The password is the BASIC_AUTH_PASSWORD secret, or generated once
+  # into SSM when that secret is unset.
+  BASIC_AUTH_USER: ${{ vars.BASIC_AUTH_USER || 'spectrum' }}
 
 concurrency:
   group: deploy-${{ inputs.environment }}
@@ -125,6 +128,9 @@ jobs:
         run: |
           npx next typegen
           npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm test
 
       # Pages are prerendered from Contentful during the build, so the build needs the
       # same space and delivery token the server uses at runtime.
@@ -232,6 +238,7 @@ jobs:
           GH_CONTENTFUL_PREVIEW_TOKEN: ${{ secrets.CONTENTFUL_PREVIEW_TOKEN }}
           GH_CONTENTFUL_PREVIEW_SECRET: ${{ secrets.CONTENTFUL_PREVIEW_SECRET }}
           GH_CONTENTFUL_REVALIDATE_SECRET: ${{ secrets.CONTENTFUL_REVALIDATE_SECRET }}
+          GH_BASIC_AUTH_PASSWORD: ${{ secrets.BASIC_AUTH_PASSWORD }}
         run: |
           set -euo pipefail
           TAGS="Key=org,Value=$ORG_TAG Key=project,Value=$PROJECT_ID Key=environment,Value=$DEPLOY_ENV Key=ManagedBy,Value=github-actions"
@@ -263,10 +270,10 @@ jobs:
             fi
           done
 
-          # Preview and revalidate secrets: a GitHub secret wins when set; otherwise one
-          # is generated once and kept, so the URL configured in Contentful survives
-          # redeploys.
-          for KEY in CONTENTFUL_PREVIEW_SECRET CONTENTFUL_REVALIDATE_SECRET; do
+          # Preview, revalidate and basic auth secrets: a GitHub secret wins when set;
+          # otherwise one is generated once and kept, so the URL configured in Contentful
+          # and the password people were given survive redeploys.
+          for KEY in CONTENTFUL_PREVIEW_SECRET CONTENTFUL_REVALIDATE_SECRET BASIC_AUTH_PASSWORD; do
             VAR="GH_$KEY"
             if [ -n "${!VAR}" ]; then
               ssm_put "$SSM_PREFIX/$KEY" "${!VAR}"
@@ -394,6 +401,7 @@ jobs:
             --argjson secrets "$SECRETS_MAP" \
             --arg spaceId "${CONTENTFUL_SPACE_ID:-}" \
             --arg cfEnv "$CONTENTFUL_ENVIRONMENT" \
+            --arg authUser "$BASIC_AUTH_USER" \
             '{
                ImageRepository: {
                  ImageIdentifier: $img,
@@ -403,7 +411,8 @@ jobs:
                    RuntimeEnvironmentVariables: ({
                      NODE_ENV: "production",
                      CONTENTFUL_SPACE_ID: $spaceId,
-                     CONTENTFUL_ENVIRONMENT: $cfEnv
+                     CONTENTFUL_ENVIRONMENT: $cfEnv,
+                     BASIC_AUTH_USER: $authUser
                    } | with_entries(select(.value != ""))),
                    RuntimeEnvironmentSecrets: $secrets
                  }
@@ -594,31 +603,50 @@ jobs:
         run: |
           set -euo pipefail
           # Probes the App Runner URL, which works before the custom domain's certificate is issued.
-          HOME_CODE=$(curl -s -o /tmp/home.html -w '%{http_code}' --max-time 30 "$SERVICE_URL/")
-          echo "GET / -> $HOME_CODE"
-          if [ "$HOME_CODE" != "200" ]; then echo "::error::/ returned $HOME_CODE"; exit 1; fi
+          fail() { echo "::error::$1"; exit 1; }
+          code() { curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$@"; }
+          ssm() { aws ssm get-parameter --name "$SSM_PREFIX/$1" --with-decryption --query Parameter.Value --output text; }
+          PW=$(ssm BASIC_AUTH_PASSWORD); echo "::add-mask::$PW"
+          SECRET=$(ssm CONTENTFUL_PREVIEW_SECRET); echo "::add-mask::$SECRET"
+          [ -n "$PW" ] && [ -n "$SECRET" ] || fail "Could not read the basic auth password or preview secret from SSM."
+
+          # --- Basic auth gate ---
+          # Headers are captured into a variable before matching: `curl | grep -q` under
+          # pipefail fails when grep exits early and curl gets SIGPIPE.
+          C=$(code "$SERVICE_URL/"); echo "GET / without credentials -> $C"
+          [ "$C" = "401" ] || fail "/ answered $C without credentials - the basic auth gate is not active."
+          H=$(curl -s -D - -o /dev/null --max-time 30 "$SERVICE_URL/")
+          grep -qi '^www-authenticate: basic' <<<"$H" || fail "The 401 has no Basic challenge."
+          C=$(code -u "$BASIC_AUTH_USER:wrong-password" "$SERVICE_URL/"); echo "GET / with a wrong password -> $C"
+          [ "$C" = "401" ] || fail "/ accepted a wrong password ($C)."
+          C=$(curl -s -o /tmp/home.html -w '%{http_code}' --max-time 30 -u "$BASIC_AUTH_USER:$PW" "$SERVICE_URL/")
+          echo "GET / with credentials -> $C"
+          [ "$C" = "200" ] || fail "/ returned $C with the right credentials."
           if grep -q "Connect Contentful" /tmp/home.html; then
             echo "::warning::/ shows the 'Connect Contentful' notice - the Contentful secrets were not available to the build."
           fi
+          C=$(code "$SERVICE_URL/robots.txt"); echo "GET /robots.txt without credentials -> $C"
+          [ "$C" = "200" ] || fail "/robots.txt returned $C; it is the health check and must stay open."
 
-          # A wrong secret must be refused, and the right one must enable draft mode
-          # with a cookie the Contentful preview iframe (a third-party context) can keep.
-          BAD=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$SERVICE_URL/api/draft?secret=wrong")
-          echo "GET /api/draft?secret=wrong -> $BAD"
-          if [ "$BAD" != "401" ]; then echo "::error::/api/draft accepted a wrong secret ($BAD)"; exit 1; fi
-
-          SECRET=$(aws ssm get-parameter --name "$SSM_PREFIX/CONTENTFUL_PREVIEW_SECRET" --with-decryption --query Parameter.Value --output text)
-          echo "::add-mask::$SECRET"
-          HDRS=$(curl -s -D - -o /dev/null --max-time 20 "$SERVICE_URL/api/draft?secret=$SECRET&slug=home")
-          CODE=$(echo "$HDRS" | head -1 | awk '{print $2}')
-          echo "GET /api/draft?secret=*** -> $CODE"
-          if ! echo "$HDRS" | grep -qi '^set-cookie: __prerender_bypass='; then
-            echo "::error::/api/draft did not set the draft mode cookie."; exit 1
-          fi
-          if ! echo "$HDRS" | grep -i '^set-cookie: __prerender_bypass=' | grep -qi 'samesite=none'; then
-            echo "::warning::The draft mode cookie is not SameSite=None, so the Contentful preview iframe may not keep it."
-          fi
-          echo "Draft mode cookie set"
+          # --- Preview link: what the Contentful iframe does, with no Basic credentials ---
+          C=$(code "$SERVICE_URL/api/draft?secret=wrong"); echo "GET /api/draft?secret=wrong -> $C"
+          [ "$C" = "401" ] || fail "/api/draft accepted a wrong secret ($C)."
+          HDRS=$(curl -s -D - -o /dev/null --max-time 20 "$SERVICE_URL/api/draft?secret=$SECRET&slug=home" | tr -d '\r')
+          DRAFT=$(echo "$HDRS" | grep -i '^set-cookie: __prerender_bypass=' | tail -1)
+          ACCESS=$(echo "$HDRS" | grep -i '^set-cookie: preview_access=' | tail -1)
+          [ -n "$DRAFT" ] || fail "/api/draft did not set the draft mode cookie."
+          [ -n "$ACCESS" ] || fail "/api/draft did not set the preview access cookie."
+          for COOKIE in "$DRAFT" "$ACCESS"; do
+            grep -qi 'partitioned' <<<"$COOKIE" || fail "A preview cookie is not Partitioned, so browsers that block third-party cookies will drop it."
+            grep -qi 'samesite=none' <<<"$COOKIE" || fail "A preview cookie is not SameSite=None."
+          done
+          JAR="$(echo "$DRAFT" | sed -E 's/^set-cookie: ([^;]+).*/\1/I'); $(echo "$ACCESS" | sed -E 's/^set-cookie: ([^;]+).*/\1/I')"
+          C=$(code -H "Cookie: $JAR" "$SERVICE_URL/"); echo "GET / with the preview cookies only -> $C"
+          [ "$C" = "200" ] || fail "The preview cookies did not pass the gate ($C)."
+          H=$(curl -s -D - -o /dev/null --max-time 30 -H "Cookie: $JAR" "$SERVICE_URL/")
+          grep -qi '^cache-control: private, no-cache, no-store' <<<"$H" \
+            || fail "The preview cookies passed the gate but draft mode is not active."
+          echo "Basic auth gate and preview link verified"
 
       - name: Deployment summary
         if: always()
@@ -641,6 +669,7 @@ jobs:
             echo "| **App Runner URL** | ${SERVICE_URL} |"
             echo "| **Custom domain** | https://${FQDN} (\`${DOMAIN_STATUS}\`) |"
             echo "| **Contentful preview URL** | \`https://${FQDN}/api/draft?secret=<CONTENTFUL_PREVIEW_SECRET>&slug={entry.fields.slug}\` |"
+            echo "| **Basic auth** | user \`${BASIC_AUTH_USER}\`, password in SSM \`${SSM_PREFIX}/BASIC_AUTH_PASSWORD\` |"
             echo "| **Contentful webhook** | \`POST https://${FQDN}/api/revalidate\` with header \`x-revalidate-secret: <CONTENTFUL_REVALIDATE_SECRET>\` |"
             echo "| **Runtime secrets** | SSM \`${SSM_PREFIX}/*\` |"
             echo "| **Branch / SHA** | \`${DEPLOY_BRANCH}\` @ \`${TAG}\` |"
