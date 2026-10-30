@@ -631,7 +631,13 @@ jobs:
           # --- Preview link: what the Contentful iframe does, with no Basic credentials ---
           C=$(code "$SERVICE_URL/api/draft?secret=wrong"); echo "GET /api/draft?secret=wrong -> $C"
           [ "$C" = "401" ] || fail "/api/draft accepted a wrong secret ($C)."
-          HDRS=$(curl -s -D - -o /dev/null --max-time 20 "$SERVICE_URL/api/draft?secret=$SECRET&slug=home" | tr -d '\r')
+          # Opened in a tab, the link must not unlock the site: no access cookie.
+          HDRS=$(curl -s -D - -o /dev/null --max-time 20 -H 'Sec-Fetch-Dest: document' "$SERVICE_URL/api/draft?secret=$SECRET&slug=home" | tr -d '\r')
+          ! grep -qi '^set-cookie: preview_access=' <<<"$HDRS" || fail "/api/draft opened in a tab set the access cookie; only a frame should get it."
+          grep -qi '^set-cookie: __prerender_bypass=' <<<"$HDRS" || fail "/api/draft opened in a tab did not enable draft mode."
+          echo "GET /api/draft in a tab -> draft mode only, no access cookie"
+          # Loaded in a frame, as Contentful's pane does, it sets both cookies.
+          HDRS=$(curl -s -D - -o /dev/null --max-time 20 -H 'Sec-Fetch-Dest: iframe' "$SERVICE_URL/api/draft?secret=$SECRET&slug=home" | tr -d '\r')
           DRAFT=$(echo "$HDRS" | grep -i '^set-cookie: __prerender_bypass=' | tail -1)
           ACCESS=$(echo "$HDRS" | grep -i '^set-cookie: preview_access=' | tail -1)
           [ -n "$DRAFT" ] || fail "/api/draft did not set the draft mode cookie."

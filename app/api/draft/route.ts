@@ -5,6 +5,7 @@ import {
   PREVIEW_ACCESS_COOKIE,
   PREVIEW_ACCESS_MAX_AGE,
   isBasicAuthEnabled,
+  isFramedRequest,
   previewAccessToken,
 } from "@/lib/basic-auth";
 
@@ -24,15 +25,16 @@ export async function GET(request: Request) {
 
   // Next sets the draft mode cookie without Partitioned, so a browser that blocks
   // third-party cookies drops it inside Contentful's preview iframe. Set it again with
-  // the same value and Partitioned. The preview secret also grants the access cookie
-  // that the basic auth gate accepts (lib/basic-auth.ts).
+  // the same value and Partitioned. Inside a frame, the preview secret also grants the
+  // access cookie that the basic auth gate accepts (lib/basic-auth.ts); opened in a
+  // tab, the browser still has to sign in.
   const store = await cookies();
   const draftValue = store.get(DRAFT_COOKIE)?.value;
   if (draftValue) {
     store.set(DRAFT_COOKIE, draftValue, CROSS_SITE_COOKIE);
   }
   const token = previewAccessToken();
-  if (isBasicAuthEnabled() && token) {
+  if (isBasicAuthEnabled() && token && isFramedRequest(request.headers)) {
     store.set(PREVIEW_ACCESS_COOKIE, token, { ...CROSS_SITE_COOKIE, maxAge: PREVIEW_ACCESS_MAX_AGE });
   }
 
