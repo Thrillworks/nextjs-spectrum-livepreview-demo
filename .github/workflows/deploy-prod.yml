@@ -1,0 +1,19 @@
+name: Deploy Production
+
+# Production trunk is `main`, deployed to the `prod` environment. This demo has one
+# environment only.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: prod
+      branch: main
+    secrets: inherit
