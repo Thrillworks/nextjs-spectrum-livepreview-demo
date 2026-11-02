@@ -10,7 +10,9 @@ export const CONTENTFUL_TAG = "contentful";
 const ASSET_FIELDS = /* GraphQL */ `
   fragment AssetFields on Asset {
     __typename
-    sys { id }
+    sys {
+      id
+    }
     url
     title
     description
@@ -28,29 +30,39 @@ const PAGE_QUERY = /* GraphQL */ `
     pageCollection(where: { slug: $slug }, limit: 1, preview: $preview) {
       items {
         __typename
-        sys { id }
+        sys {
+          id
+        }
         title
         slug
         hero(preview: $preview) {
           __typename
-          sys { id }
+          sys {
+            id
+          }
           heading
           text
-          image(preview: $preview) { ...AssetFields }
+          image(preview: $preview) {
+            ...AssetFields
+          }
         }
         sectionsCollection(limit: 20, preview: $preview) {
           items {
             __typename
             ... on Entry {
-              sys { id }
+              sys {
+                id
+              }
             }
             ... on MediaCopy {
               heading
-              body { json }
-              image(preview: $preview) { ...AssetFields }
+              body {
+                json
+              }
+              image(preview: $preview) {
+                ...AssetFields
+              }
               imagePosition
-              linkLabel
-              linkUrl
             }
             ... on ContactForm {
               heading
@@ -72,20 +84,28 @@ const ARTICLE_QUERY = /* GraphQL */ `
     articleCollection(where: { slug: $slug }, limit: 1, preview: $preview) {
       items {
         __typename
-        sys { id }
+        sys {
+          id
+        }
         title
         slug
         date
-        heroImage(preview: $preview) { ...AssetFields }
+        heroImage(preview: $preview) {
+          ...AssetFields
+        }
         categoryTagsCollection(limit: 10, preview: $preview) {
           items {
             __typename
-            sys { id }
+            sys {
+              id
+            }
             name
             slug
           }
         }
-        body { json }
+        body {
+          json
+        }
       }
     }
   }
@@ -94,7 +114,9 @@ const ARTICLE_QUERY = /* GraphQL */ `
 const ARTICLE_SLUGS_QUERY = /* GraphQL */ `
   query ArticleSlugs($preview: Boolean!) {
     articleCollection(limit: 1000, preview: $preview) {
-      items { slug }
+      items {
+        slug
+      }
     }
   }
 `;
@@ -102,7 +124,9 @@ const ARTICLE_SLUGS_QUERY = /* GraphQL */ `
 const PAGE_SLUGS_QUERY = /* GraphQL */ `
   query PageSlugs($preview: Boolean!) {
     pageCollection(limit: 1000, preview: $preview) {
-      items { slug }
+      items {
+        slug
+      }
     }
   }
 `;
@@ -117,11 +141,9 @@ export async function getPage(slug: string): Promise<PageResult | null> {
   // Draft mode skips the cache entirely, so preview always shows fresh drafts.
   const { isEnabled: preview } = await draftMode();
 
-  const data = await contentfulGraphQL<{ pageCollection: { items: PageResult[] } }>(
-    PAGE_QUERY,
-    { slug },
-    preview,
-  );
+  const data = await contentfulGraphQL<{
+    pageCollection: { items: PageResult[] };
+  }>(PAGE_QUERY, { slug }, preview);
 
   // Returned as the raw GraphQL result: live updates need the untransformed
   // response. It is mapped to component props on the client (see LivePage).
@@ -135,11 +157,9 @@ export async function getPageSlugs(): Promise<string[]> {
 
   if (!isContentfulConfigured) return [];
 
-  const data = await contentfulGraphQL<{ pageCollection: { items: { slug: string }[] } }>(
-    PAGE_SLUGS_QUERY,
-    {},
-    false,
-  );
+  const data = await contentfulGraphQL<{
+    pageCollection: { items: { slug: string }[] };
+  }>(PAGE_SLUGS_QUERY, {}, false);
 
   return data.pageCollection.items.map((item) => item.slug);
 }
@@ -153,11 +173,9 @@ export async function getArticle(slug: string): Promise<ArticleResult | null> {
 
   const { isEnabled: preview } = await draftMode();
 
-  const data = await contentfulGraphQL<{ articleCollection: { items: ArticleResult[] } }>(
-    ARTICLE_QUERY,
-    { slug },
-    preview,
-  );
+  const data = await contentfulGraphQL<{
+    articleCollection: { items: ArticleResult[] };
+  }>(ARTICLE_QUERY, { slug }, preview);
 
   return data.articleCollection.items[0] ?? null;
 }
@@ -169,11 +187,9 @@ export async function getArticleSlugs(): Promise<string[]> {
 
   if (!isContentfulConfigured) return [];
 
-  const data = await contentfulGraphQL<{ articleCollection: { items: { slug: string }[] } }>(
-    ARTICLE_SLUGS_QUERY,
-    {},
-    false,
-  );
+  const data = await contentfulGraphQL<{
+    articleCollection: { items: { slug: string }[] };
+  }>(ARTICLE_SLUGS_QUERY, {}, false);
 
   return data.articleCollection.items.map((item) => item.slug);
 }

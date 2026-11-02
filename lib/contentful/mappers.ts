@@ -58,10 +58,6 @@ function toSection(result: SectionResult | OtherSectionResult): Section {
         body: section.body?.json,
         image: toImage(section.image),
         imagePosition: section.imagePosition === "right" ? "right" : "left",
-        link:
-          section.linkLabel && section.linkUrl
-            ? { label: section.linkLabel, url: section.linkUrl }
-            : undefined,
       };
     case "ContactForm":
       return {
