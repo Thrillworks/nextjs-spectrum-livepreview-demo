@@ -1,5 +1,9 @@
+import { useContentfulInspectorMode } from "@contentful/live-preview/react";
 import type { ComponentType } from "react";
-import type { ContactFormSection, ContactFormVariant } from "@/lib/contentful/types";
+import type {
+  ContactFormSection,
+  ContactFormVariant,
+} from "@/lib/contentful/types";
 import { nunitoSans } from "@/lib/fonts";
 
 const fieldClassName =
@@ -8,9 +12,20 @@ const fieldClassName =
 const labelClassName = "block text-[15px] font-bold text-white";
 
 // Placeholder options until the real lists are defined.
-const RELATIONSHIP_OPTIONS = ["Client", "Family member", "Healthcare professional", "Employee", "Other"];
+const RELATIONSHIP_OPTIONS = [
+  "Client",
+  "Family member",
+  "Healthcare professional",
+  "Employee",
+  "Other",
+];
 const RECIPIENT_OPTIONS = ["Client Services", "Careers", "Billing", "Media"];
-const SUBJECT_OPTIONS = ["General Inquiry", "Request a Consultation", "Feedback", "Other"];
+const SUBJECT_OPTIONS = [
+  "General Inquiry",
+  "Request a Consultation",
+  "Feedback",
+  "Other",
+];
 
 function Caret() {
   return (
@@ -68,21 +83,33 @@ function SelectField({
 function CaptchaPlaceholder() {
   return (
     <div className="flex h-[76px] w-[302px] items-center gap-3 rounded-[3px] border border-[#d3d3d3] bg-[#f9f9f9] pl-3 pr-3 text-sm text-zinc-800 shadow-[0_0_4px_1px_rgba(0,0,0,0.08)]">
-      <span className="h-7 w-7 rounded-sm border-2 border-[#c1c1c1] bg-white" aria-hidden />
+      <span
+        className="h-7 w-7 rounded-sm border-2 border-[#c1c1c1] bg-white"
+        aria-hidden
+      />
       <span className="flex-1">I&apos;m not a robot</span>
       <span className="text-[10px] text-zinc-500">reCAPTCHA</span>
     </div>
   );
 }
 
-function ContactUsFields({ submitLabel }: Pick<ContactFormSection, "submitLabel">) {
+function ContactUsFields({
+  id,
+  submitLabel,
+}: Pick<ContactFormSection, "id" | "submitLabel">) {
+  const inspectorProps = useContentfulInspectorMode({ entryId: id });
+
   return (
     <>
       <div className="grid gap-x-[21px] gap-y-6 md:grid-cols-2">
         <div className="grid content-start gap-6">
           <label className={labelClassName}>
             First &amp; Last Name
-            <input name="name" autoComplete="name" className={`${fieldClassName} font-normal`} />
+            <input
+              name="name"
+              autoComplete="name"
+              className={`${fieldClassName} font-normal`}
+            />
           </label>
           <label className={labelClassName}>
             Email *
@@ -127,16 +154,18 @@ function ContactUsFields({ submitLabel }: Pick<ContactFormSection, "submitLabel"
             placeholder="Select"
             required
           />
-          <SelectField label="Subject" name="subject" options={SUBJECT_OPTIONS} />
+          <SelectField
+            label="Subject"
+            name="subject"
+            options={SUBJECT_OPTIONS}
+          />
         </div>
-      </div>
-      <div className="mt-6">
-        <CaptchaPlaceholder />
       </div>
       <div className="mt-9 flex justify-center">
         <button
           type="submit"
           className="h-12 bg-[#ffc445] px-7 text-[17px] font-bold tracking-wide text-[#1c3461] transition-colors hover:bg-[#ffb81c]"
+          {...inspectorProps({ fieldId: "submitLabel" })}
         >
           {submitLabel}
         </button>
@@ -146,15 +175,32 @@ function ContactUsFields({ submitLabel }: Pick<ContactFormSection, "submitLabel"
 }
 
 // Visual-only newsletter signup: a short blurb with an inline email field.
-function SubscribeForm({ heading, description, submitLabel }: ContactFormSection) {
+function SubscribeForm({
+  id,
+  heading,
+  description,
+  submitLabel,
+}: ContactFormSection) {
+  const inspectorProps = useContentfulInspectorMode({ entryId: id });
+
   return (
     <section className={`${nunitoSans.className} bg-white pt-6 text-[#1c3461]`}>
       <div className="mx-auto max-w-[460px] px-4 sm:px-0">
         {heading && (
-          <h2 className="text-[15px] font-bold leading-[1.35]">{heading}</h2>
+          <h2
+            className="text-[15px] font-bold leading-[1.35]"
+            {...inspectorProps({ fieldId: "heading" })}
+          >
+            {heading}
+          </h2>
         )}
         {description && (
-          <p className="mt-1 text-[15px] leading-[1.35]">{description}</p>
+          <p
+            className="mt-1 text-[15px] leading-[1.35]"
+            {...inspectorProps({ fieldId: "description" })}
+          >
+            {description}
+          </p>
         )}
         <form className="mt-4 flex gap-3.5">
           <input type="hidden" name="formType" value="subscribe" />
@@ -169,6 +215,7 @@ function SubscribeForm({ heading, description, submitLabel }: ContactFormSection
           <button
             type="button"
             className="h-[42px] shrink-0 bg-[#00589b] px-[17px] text-sm tracking-wide text-white transition-colors hover:bg-[#004a83]"
+            {...inspectorProps({ fieldId: "submitLabel" })}
           >
             {submitLabel}
           </button>
@@ -181,15 +228,38 @@ function SubscribeForm({ heading, description, submitLabel }: ContactFormSection
 
 // Renders the form fields only. Submissions aren't handled yet: point the
 // form's action at a route handler or server action to wire it up.
-function ContactUsForm({ heading, description, submitLabel }: ContactFormSection) {
+function ContactUsForm({
+  id,
+  heading,
+  description,
+  submitLabel,
+}: ContactFormSection) {
+  const inspectorProps = useContentfulInspectorMode({ entryId: id });
+
   return (
-    <section className={`${nunitoSans.className} bg-[#17325e] py-16 text-white`}>
+    <section
+      className={`${nunitoSans.className} bg-[#17325e] py-16 text-white`}
+    >
       <div className="mx-auto max-w-[987px] px-6">
-        {heading && <h2 className="text-3xl font-bold tracking-tight">{heading}</h2>}
-        {description && <p className="mt-4 text-lg leading-7">{description}</p>}
+        {heading && (
+          <h2
+            className="text-3xl font-bold tracking-tight"
+            {...inspectorProps({ fieldId: "heading" })}
+          >
+            {heading}
+          </h2>
+        )}
+        {description && (
+          <p
+            className="mt-4 text-lg leading-7"
+            {...inspectorProps({ fieldId: "description" })}
+          >
+            {description}
+          </p>
+        )}
         <form className="mt-12">
           <input type="hidden" name="formType" value="contactUs" />
-          <ContactUsFields submitLabel={submitLabel} />
+          <ContactUsFields id={id} submitLabel={submitLabel} />
         </form>
       </div>
     </section>
@@ -197,7 +267,10 @@ function ContactUsForm({ heading, description, submitLabel }: ContactFormSection
 }
 
 // One layout per Contentful formType.
-const variants: Record<ContactFormVariant, ComponentType<ContactFormSection>> = {
+const variants: Record<
+  ContactFormVariant,
+  ComponentType<ContactFormSection>
+> = {
   contactUs: ContactUsForm,
   subscribe: SubscribeForm,
 };

@@ -1,10 +1,10 @@
+import { useContentfulInspectorMode } from "@contentful/live-preview/react";
 import {
   documentToReactComponents,
   type Options,
 } from "@contentful/rich-text-react-renderer";
 import { BLOCKS, INLINES } from "@contentful/rich-text-types";
 import Image from "next/image";
-import Link from "next/link";
 import type { MediaCopySection } from "@/lib/contentful/types";
 import { nunitoSans } from "@/lib/fonts";
 
@@ -34,44 +34,22 @@ const richTextOptions: Options = {
         {children}
       </blockquote>
     ),
-    [INLINES.HYPERLINK]: (node, children) => (
-      <a
-        href={node.data.uri}
-        className="font-semibold text-[#00589b] underline underline-offset-4"
-      >
-        {children}
-      </a>
-    ),
+    // Hyperlinks aren't supported: render the link text as plain text. The
+    // renderer would otherwise emit a default <a> for these nodes.
+    [INLINES.HYPERLINK]: (_, children) => <>{children}</>,
+    [INLINES.ENTRY_HYPERLINK]: (_, children) => <>{children}</>,
+    [INLINES.ASSET_HYPERLINK]: (_, children) => <>{children}</>,
   },
 };
 
-function Chevron() {
-  return (
-    <svg
-      viewBox="0 0 8 12"
-      className="h-3 w-2 stroke-current"
-      fill="none"
-      aria-hidden
-    >
-      <path d="M1.5 1.5L6 6l-4.5 4.5" strokeWidth="2" />
-    </svg>
-  );
-}
-
 export function MediaCopy({
+  id,
   heading,
   body,
   image,
   imagePosition,
-  link,
 }: MediaCopySection) {
-  const title = heading && (
-    <span className="inline-flex items-center gap-3">
-      {heading}
-      {link && <Chevron />}
-    </span>
-  );
-
+  const inspectorProps = useContentfulInspectorMode({ entryId: id });
   return (
     <section
       className={`${nunitoSans.className} grid bg-white md:min-h-[655px] md:grid-cols-[46.5%_1fr] py-10`}
@@ -86,20 +64,28 @@ export function MediaCopy({
             fill
             sizes="(min-width: 768px) 47vw, 100vw"
             className="object-cover"
+            {...inspectorProps({ fieldId: "image" })}
           />
         )}
       </div>
       <div className="max-w-[540px] px-6 py-10 text-[#333] md:px-16 md:py-16">
         {heading && (
-          <h2 className="text-[22px] font-bold text-[#00589b]">
-            {link ? <Link href={link.url}>{title}</Link> : title}
+          <h2
+            className="text-[22px] font-bold text-[#00589b]"
+            {...inspectorProps({ fieldId: "heading" })}
+          >
+            {heading}
           </h2>
         )}
         <div
           className="mt-4 mb-8 w-16 border-b-[3px] border-dotted border-[#00589b]"
           aria-hidden
         />
-        {body && documentToReactComponents(body, richTextOptions)}
+        {body && (
+          <div {...inspectorProps({ fieldId: "body" })}>
+            {documentToReactComponents(body, richTextOptions)}
+          </div>
+        )}
       </div>
     </section>
   );
