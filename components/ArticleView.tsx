@@ -1,3 +1,4 @@
+import { useContentfulInspectorMode } from "@contentful/live-preview/react";
 import {
   documentToReactComponents,
   type Options,
@@ -29,14 +30,11 @@ const richTextOptions: Options = {
     [BLOCKS.QUOTE]: (_, children) => (
       <blockquote className="mt-6 border-l-4 border-[#00589b] pl-4 italic">{children}</blockquote>
     ),
-    [INLINES.HYPERLINK]: (node, children) => (
-      <a
-        href={node.data.uri}
-        className="font-semibold text-[#00589b] underline underline-offset-2"
-      >
-        {children}
-      </a>
-    ),
+    // Hyperlinks aren't supported: render the link text as plain text. The
+    // renderer would otherwise emit a default <a> for these nodes.
+    [INLINES.HYPERLINK]: (_, children) => <>{children}</>,
+    [INLINES.ENTRY_HYPERLINK]: (_, children) => <>{children}</>,
+    [INLINES.ASSET_HYPERLINK]: (_, children) => <>{children}</>,
   },
 };
 
@@ -56,12 +54,17 @@ function formatDate(iso: string): string {
   return `${monthName} ${day}${suffix}, ${year}`;
 }
 
-export function ArticleView({ title, date, heroImage, tags, body }: Article) {
+export function ArticleView({ id, title, date, heroImage, tags, body }: Article) {
+  const inspectorProps = useContentfulInspectorMode({ entryId: id });
+
   return (
     <main className={`${nunitoSans.className} flex-1 bg-white text-[#333]`}>
       <article className="mx-auto max-w-3xl px-6 pb-20 pt-10">
         {tags.length > 0 && (
-          <ul className="flex flex-wrap gap-2">
+          <ul
+            className="flex flex-wrap gap-2"
+            {...inspectorProps({ fieldId: "categoryTags" })}
+          >
             {tags.map((tag) => (
               <li
                 key={tag.id}
@@ -73,9 +76,18 @@ export function ArticleView({ title, date, heroImage, tags, body }: Article) {
           </ul>
         )}
 
-        <h1 className="mt-6 text-[32px] font-normal leading-[1.2] text-[#1b3a6b]">{title}</h1>
+        <h1
+          className="mt-6 text-[32px] font-normal leading-[1.2] text-[#1b3a6b]"
+          {...inspectorProps({ fieldId: "title" })}
+        >
+          {title}
+        </h1>
 
-        {date && <p className="mt-4 text-xs text-[#555]">{formatDate(date)}</p>}
+        {date && (
+          <p className="mt-4 text-xs text-[#555]" {...inspectorProps({ fieldId: "date" })}>
+            {formatDate(date)}
+          </p>
+        )}
 
         {heroImage && (
           <Image
@@ -86,10 +98,13 @@ export function ArticleView({ title, date, heroImage, tags, body }: Article) {
             priority
             sizes="(min-width: 768px) 768px, 100vw"
             className="mt-6 aspect-[16/9] w-full object-cover"
+            {...inspectorProps({ fieldId: "heroImage" })}
           />
         )}
 
-        <div className="mt-10">{body && documentToReactComponents(body, richTextOptions)}</div>
+        <div className="mt-10" {...inspectorProps({ fieldId: "body" })}>
+          {body && documentToReactComponents(body, richTextOptions)}
+        </div>
       </article>
     </main>
   );

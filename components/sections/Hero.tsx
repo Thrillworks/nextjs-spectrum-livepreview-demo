@@ -1,10 +1,13 @@
+import { useContentfulInspectorMode } from "@contentful/live-preview/react";
 import Image from "next/image";
 import type { HeroSection } from "@/lib/contentful/types";
 import { firaSans } from "@/lib/fonts";
 
 // The heading stays in the markup for screen readers and SEO; the design only
 // shows the photo and the supporting text in a callout box.
-export function Hero({ heading, text, image }: HeroSection) {
+export function Hero({ id, heading, text, image }: HeroSection) {
+  const inspectorProps = useContentfulInspectorMode({ entryId: id });
+
   return (
     <section className="relative bg-white md:h-[500px]">
       <h1 className="sr-only">{heading}</h1>
@@ -17,6 +20,7 @@ export function Hero({ heading, text, image }: HeroSection) {
           priority
           sizes="100vw"
           className="h-64 w-full object-cover object-left sm:h-80 md:absolute md:inset-0 md:h-full"
+          {...inspectorProps({ fieldId: "image" })}
         />
       )}
       {text && (
@@ -24,6 +28,7 @@ export function Hero({ heading, text, image }: HeroSection) {
           <FlowerMark className="absolute -top-0 right-10 h-[95px] w-[140px] md:-top-[70px]" />
           <p
             className={`${firaSans.className} bg-[#0062a6] px-8 pb-8 pt-14 text-xl leading-9 text-white md:pb-12 md:pl-8 md:pr-16 md:pt-10 md:text-[28px] md:leading-10`}
+            {...inspectorProps({ fieldId: "text" })}
           >
             {text}
           </p>
